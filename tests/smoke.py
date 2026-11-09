@@ -1,8 +1,9 @@
 """
-FinLens 冒烟测试：24 条断言，覆盖主链路 / 数据缺失与接口失败 / 合规边界。
+FinLens 冒烟测试：32 条断言，覆盖主链路 / 数据缺失与接口失败 / 合规边界 / 审计补强。
 
 运行：python tests/smoke.py
 说明：脚本自行启动一个临时端口上的服务，跑完自动关闭；不需要预先起服务。
+      默认端口被占用时自动改为系统分配，避免换机器后端口冲突直接失败。
       少数用例依赖环境（是否安装 pypdf），会在结果里标注实际走的分支。
 """
 
@@ -10,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -404,8 +406,23 @@ def d8():
     return "HIT"
 
 
+def pick_port() -> int:
+    """优先用 SMOKE_PORT / 4310；被占用则让系统分配空闲端口。"""
+    for cand in (PORT, 0):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("127.0.0.1", cand))
+                return s.getsockname()[1]
+            except OSError:
+                continue
+    return PORT
+
+
 def main() -> int:
-    env = {**os.environ, "PORT": str(PORT)}
+    global BASE
+    port = pick_port()
+    BASE = f"http://127.0.0.1:{port}"
+    env = {**os.environ, "PORT": str(port)}
     proc = subprocess.Popen([sys.executable, "app.py"], cwd=ROOT, env=env,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
