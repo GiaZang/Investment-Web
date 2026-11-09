@@ -997,6 +997,30 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, target.read_bytes(), MIME.get(target.suffix, "application/octet-stream"))
         return self.send(404, "not found", "text/plain; charset=utf-8")
 
+    def do_HEAD(self):
+        """只回响应头，供链接预览、监控探活与部分客户端预检使用。
+
+        HEAD 不执行业务逻辑（避免探活请求产生副作用），浏览器正常访问走 GET。
+        没有这个方法时，网关会把 HEAD 请求回成 501，部分预览器会误判链接不可用。
+        """
+        path = urlparse(self.path).path
+        if path.startswith("/api/"):
+            return self.head_only(200, "application/json; charset=utf-8", 0)
+        target = (STATIC / ("/index.html" if path == "/" else path).lstrip("/")).resolve()
+        if not target.is_relative_to(STATIC.resolve()):
+            return self.head_only(403, "text/plain; charset=utf-8", 0)
+        if target.is_file():
+            return self.head_only(200, MIME.get(target.suffix, "application/octet-stream"),
+                                  target.stat().st_size)
+        return self.head_only(404, "text/plain; charset=utf-8", 0)
+
+    def head_only(self, status: int, ctype: str, length: int):
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(length))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
     def do_POST(self):
         u = urlparse(self.path)
         qs = {k: v[0] for k, v in parse_qs(u.query).items()}

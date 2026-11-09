@@ -209,6 +209,36 @@
 </div>
 
 <script>
+/* 直接双击 index.html（file:// 协议）时，浏览器不允许页面请求后端接口，
+   页面必然是空的。这里先把正确用法讲清楚，避免被误判成"页面坏了"。 */
+if (location.protocol === 'file:') {
+  document.title = 'FinLens · 需要通过服务访问';
+  document.body.innerHTML = `
+  <div style="max-width:660px;margin:11vh auto;padding:0 24px;font-family:system-ui,-apple-system,'Microsoft YaHei',sans-serif;color:#15181e">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px">
+      <span style="width:30px;height:30px;border-radius:8px;background:linear-gradient(135deg,#3b82f6,#8b5cf6);display:grid;place-items:center;color:#fff;font-weight:700">F</span>
+      <b style="font-size:17px">FinLens 财报透镜</b>
+    </div>
+    <div style="background:#fff;border-radius:14px;padding:28px 30px;box-shadow:0 8px 32px rgba(0,0,0,.06)">
+      <h1 style="font-size:18px;margin:0 0 12px">这个页面需要通过服务访问，不能直接双击打开</h1>
+      <p style="color:#4b5563;margin:0 0 16px">
+        你现在打开的是本地文件（<code>file://</code>）。页面本身只是一层前端，营业收入、结论、风险雷达这些数据都要向后端接口请求，
+        而浏览器不允许本地文件请求接口，所以这里只会显示空白。
+      </p>
+      <p style="margin:0 0 8px;font-weight:600">两种正确打开方式：</p>
+      <ol style="color:#4b5563;margin:0 0 6px;padding-left:22px;line-height:1.9">
+        <li>在 <code>FinLens/</code> 目录执行 <code style="background:#f1f3f7;padding:2px 6px;border-radius:4px">python app.py</code>，
+            然后浏览器打开 <a href="http://127.0.0.1:8000">http://127.0.0.1:8000</a></li>
+        <li>或直接使用线上版本：
+            <a href="https://claimguard.app.workbuddy.host/?sharecode=3FNZEF5AVT">claimguard.app.workbuddy.host/?sharecode=3FNZEF5AVT</a></li>
+      </ol>
+      <p style="color:#6b7280;font-size:12px;margin:14px 0 0">线上版本的地址必须带 <code>?sharecode=3FNZEF5AVT</code>，只写域名会被网关拦下。</p>
+    </div>
+  </div>`;
+  throw new Error('FinLens 需要通过 HTTP 服务访问（file:// 无法请求接口）');
+}
+</script>
+<script>
 const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const S = { data: null, tab: 'summary', qa: null, loading: false };
