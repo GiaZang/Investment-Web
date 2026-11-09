@@ -101,12 +101,12 @@ def a5():
     return ",".join(hits)
 
 
-@check("主链路", "A6 归因已解释 23%~24%，毛利率列为未覆盖")
+@check("主链路", "A6 归因已解释 16%~17%，未覆盖项列全")
 def a6():
     s, d = jget("/api/analyze?code=002281&as_of=2026-11-05")
     a = d["attribution"]
     assert a["ok"], a.get("reason")
-    assert 23.0 <= a["covered_ratio"] <= 24.0, a["covered_ratio"]
+    assert 16.0 <= a["covered_ratio"] <= 17.0, a["covered_ratio"]
     assert any(c["contribution_pct"] is None for c in a["contributors"]), "缺少未覆盖项"
     return f"{a['covered_ratio']:.2f}%"
 
@@ -305,6 +305,103 @@ def c6():
         hit = [w for w in app.ADVICE_WORDS if w in c["text"]]
         assert not hit, f"{c['id']} 含建议词 {hit}"
     return "9 条全部标注"
+
+
+# ======================= 审计补强（P0/P1 回归） =======================
+
+@check("审计补强", "D1 上传别家公司的财报被拒（主体错配）")
+def d1():
+    import app
+    d = __import__("datetime").date(2026, 11, 5)
+    up = {"revenue": {"label": "营业收入", "unit": "元", "value": 1e9, "prev": None,
+                      "yoy": None, "quote": "片段", "offset": 1}}
+    try:
+        app.build_facts("002281", up, d, {"subject": "中际旭创股份有限公司", "year": 2026})
+    except app.PDFParseError as exc:
+        assert exc.code == "SUBJECT_MISMATCH", exc.code
+        return exc.code
+    raise AssertionError("别家公司的财报被当成了光迅科技的数据")
+
+
+@check("审计补强", "D2 上传件的证据不再指向内置 PDF")
+def d2():
+    import app
+    d = __import__("datetime").date(2026, 11, 5)
+    up = {"revenue": {"label": "营业收入", "unit": "元", "value": 1e9, "prev": 9e8,
+                      "yoy": 11.1, "quote": "上传片段", "offset": 30}}
+    f = app.build_facts("002281", up, d, {"subject": "光迅科技股份有限公司", "year": 2026})
+    ev = app.make_claims(f)[0]["evidence"]
+    assert ev["page"] is None and ev["url"] is None, ev
+    assert ev["offset_kind"] == "全文字符偏移", ev["offset_kind"]
+    assert f["mixed"] and f["carried_over"], "沿用了内置科目却没有标记 mixed"
+    return "page=None, url=None, 全文偏移, mixed=True"
+
+
+@check("审计补强", "D3 导出底稿同样拦截未来信息")
+def d3():
+    s, d = jget("/api/report?code=002281&as_of=2026-10-01")
+    assert s == 409 and d["error"]["code"] == "FUTURE_INFO", f"{s} {d}"
+    return "409 FUTURE_INFO"
+
+
+@check("审计补强", "D4 未来日期不得用于分析")
+def d4():
+    s, d = jget("/api/analyze?code=002281&as_of=2030-01-01")
+    assert s == 400 and d["error"]["code"] == "FUTURE_DATE", f"{s} {d}"
+    return d["error"]["code"]
+
+
+@check("审计补强", "D5 归因用变动额且比例收口到 0~100")
+def d5():
+    import app
+    d = __import__("datetime").date(2026, 11, 5)
+    a = app.attribution(app.build_facts("002281", None, d))
+    names = [c["factor"] for c in a["contributors"]]
+    assert "非经常性损益变动" in names, names          # 由 归母−扣非 两期推算，不是用存量除增量
+    assert 0 <= a["covered_ratio"] <= 100, a["covered_ratio"]
+
+    f = app.build_facts("002281", None, d)
+    f["metrics"]["nre"] = {**f["metrics"]["nre"], "prev": -5e9}   # 构造极端变动
+    a2 = app.attribution(f)
+    assert a2["covered_ratio"] == 100 and a2["clamped"], a2
+    return f"{a['covered_ratio']:.2f}% / 极端值截断为 {a2['covered_ratio']:.0f}%"
+
+
+@check("审计补强", "D6 现金流问答：正负两种情形不得自相矛盾")
+def d6():
+    import app
+    d = __import__("datetime").date(2026, 11, 5)
+    f = app.build_facts("002281", None, d)
+    neg = app._structured_answer("经营现金流和净利润差多少", f)["answer"]
+    assert "现金流为负" in neg, neg
+    f["metrics"]["ocf"] = {**f["metrics"]["ocf"], "value": 5e9}
+    pos = app._structured_answer("经营现金流和净利润差多少", f)["answer"]
+    assert "现金流为负" not in pos and "尚未转化" not in pos, pos
+    return "两支文案不再互相矛盾"
+
+
+@check("审计补强", "D7 数字白名单不误杀自己的模板，仍拦住编造值")
+def d7():
+    import app
+    d = __import__("datetime").date(2026, 11, 5)
+    f = app.build_facts("002281", None, d)
+    text = "；".join(c["text"] for c in app.make_claims(f))
+    assert app.guard_numbers(text, f, text) == [], "模板文案被自己的白名单拦下了"
+    banned = app.guard_numbers("营业收入 999.99 亿元，毛利率 47%", f, text)
+    assert "999.99" in banned and "47" in banned, banned
+    return "模板 0 误杀；编造值仍拦截"
+
+
+@check("审计补强", "D8 R7 未被营收高增稀释时判 HIT")
+def d8():
+    import app
+    d = __import__("datetime").date(2026, 11, 5)
+    f = app.build_facts("002281", None, d)
+    # 营收同比 36.94%（未达 40% 的降级条件）+ 费用率下降 >1pct → 应判 HIT，不是 NOTED
+    f["metrics"]["rd_exp"] = {**f["metrics"]["rd_exp"], "prev": 1.5e9}
+    r7 = next(r for r in app.risk_radar(f) if r["id"] == "R7")
+    assert r7["status"] == "HIT", r7["status"]
+    return "HIT"
 
 
 def main() -> int:

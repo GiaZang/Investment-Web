@@ -194,18 +194,52 @@ def extract_metrics(text: str) -> dict:
     return found
 
 
-def build_facts(code: str, uploaded: dict | None, as_of: date) -> dict:
+_SUBJECT_RE = re.compile(r"([\u4e00-\u9fa5A-Za-z]{2,14}?(?:股份有限公司|有限责任公司|有限公司))")
+_YEAR_RE = re.compile(r"(20\d{2})\s*年")
+
+
+def extract_meta(text: str) -> dict:
+    """抽取文件主体与报告期年份，用于拦截"上传了别家公司财报"这类主体错配。"""
+    head = text[:800]
+    m = _SUBJECT_RE.search(head)
+    subject = m.group(1) if m else None
+    y = _YEAR_RE.search(head)
+    return {"subject": subject, "year": int(y.group(1)) if y else None}
+
+
+def build_facts(code: str, uploaded: dict | None, as_of: date,
+                uploaded_meta: dict | None = None) -> dict:
     """以内置快照为基线，用上传文件抽到的指标覆盖同名项，并记录来源。"""
     base = COMPANIES[code]
     f = {
         "code": base["code"], "name": base["name"], "period": base["period"],
         "doc_title": base["doc_title"], "published_at": base["published_at"],
-        "pdf_url": base["pdf_url"], "page": base["page"],
+        "pdf_url": base["pdf_url"], "page": base["page"], "offset_kind": "页内字符偏移",
         "explanations": dict(base.get("explanations", {})),
         "metrics": {k: dict(v, source="builtin") for k, v in base["metrics"].items()},
         "uploaded_count": 0, "disclosure_unknown": False, "mixed": False,
+        "carried_over": [], "subject_unverified": False,
     }
     if uploaded:
+        # 主体校验：上传的是别家公司的财报 → 拒绝，不把两家数字混在一份结论里
+        if uploaded_meta and uploaded_meta.get("subject"):
+            subj = uploaded_meta["subject"]
+            if base["name"] not in subj and subj not in base["name"]:
+                raise PDFParseError(
+                    "SUBJECT_MISMATCH",
+                    f"该文件的主体是「{subj}」，与当前选择的「{base['name']}」不一致。"
+                    f"请先在左侧切换到对应公司再上传，避免把两家公司的数字混在一起。")
+        if uploaded_meta and uploaded_meta.get("year"):
+            by = int(re.match(r"\s*(20\d{2})", base["period"]).group(1)) \
+                if re.match(r"\s*(20\d{2})", base["period"]) else None
+            if by and uploaded_meta["year"] != by:
+                raise PDFParseError(
+                    "PERIOD_MISMATCH",
+                    f"该文件的报告期年份是 {uploaded_meta['year']} 年，"
+                    f"与当前选择的 {base['period']} 不一致。请选择对应报告期后再上传。")
+        if uploaded_meta is not None and not uploaded_meta.get("subject"):
+            f["subject_unverified"] = True
+
         for k, v in uploaded.items():
             if k in f["metrics"]:
                 merged = dict(f["metrics"][k])
@@ -216,13 +250,19 @@ def build_facts(code: str, uploaded: dict | None, as_of: date) -> dict:
             merged["source"] = "uploaded"
             f["metrics"][k] = merged
         f["uploaded_count"] = len(uploaded)
-        # 部分来自上传、部分仍来自内置 → 口径可能不一致，必须显式提示
-        f["mixed"] = len(uploaded) < len(base["metrics"])
+        # 漏掉的科目仍来自内置快照 → 口径混用，必须显式提示并列出沿用了哪几项
+        f["carried_over"] = [k for k in base["metrics"] if k not in uploaded]
+        f["mixed"] = bool(f["carried_over"])
         f["doc_title"] = "上传文件"
         # 上传件的真实披露日无法可靠取得：按"稿件日期当时已可得"处理并标注未知，
         # 避免把一份正常财报误判成"使用未来信息"。
         f["published_at"] = as_of.isoformat()
         f["disclosure_unknown"] = True
+        # 上传件没有稳定的页码/页内偏移，也没有可回链的原始 URL：
+        # 证据改为「全文偏移」，且不外链到内置快照的 PDF（否则等于指错原文）
+        f["page"] = None
+        f["pdf_url"] = None
+        f["offset_kind"] = "全文字符偏移"
     return f
 
 
@@ -255,6 +295,7 @@ def evidence(m: dict, f: dict) -> dict:
     return {
         "doc": f["doc_title"], "published_at": f["published_at"], "page": f.get("page"),
         "quote": m.get("quote", ""), "offset": m.get("offset"),
+        "offset_kind": f.get("offset_kind", "页内字符偏移"),
         "source": m.get("source", "builtin"), "url": f.get("pdf_url"),
     }
 
@@ -276,21 +317,43 @@ def make_claims(f: dict) -> list[dict]:
         add("C1", "成长", f"营业收入 {money(rev['value'])}，同比 {pct(rev.get('yoy'))}",
             rev["value"], "元", evidence(rev, f))
     if rev and npp and rev.get("yoy") is not None and npp.get("yoy") is not None:
-        add("C2", "成长", f"归母净利润 {money(npp['value'])}，同比 {pct(npp['yoy'])}，"
-                          f"增速快于营收 {npp['yoy'] - rev['yoy']:+.2f}pct",
+        diff = npp["yoy"] - rev["yoy"]
+        # 差值必须大于 0 才叫"快于"：否则会输出"增速快于营收 -31.94pct"这种自相矛盾的话
+        if diff > 0.5:
+            rel = f"增速快于营收 {diff:+.2f}pct"
+        elif diff < -0.5:
+            rel = f"增速低于营收 {abs(diff):.2f}pct"
+        else:
+            rel = f"增速与营收基本持平（差值 {diff:+.2f}pct）"
+        add("C2", "成长", f"归母净利润 {money(npp['value'])}，同比 {pct(npp['yoy'])}，{rel}",
             npp["value"], "元", evidence(npp, f))
     if npp and npd and npp["value"]:
+        ratio = npd["value"] / npp["value"] * 100
+        # 定性措辞必须由比例决定，不能写死
+        judge = ("主业盈利与表观利润接近" if ratio >= 90 else
+                 "主业盈利占比有所下降" if ratio >= 70 else
+                 "表观利润对非经常性损益依赖较高")
         add("C3", "质量", f"扣非净利润 {money(npd['value'])}，占归母净利润 "
-                          f"{npd['value'] / npp['value'] * 100:.2f}%，主业盈利与表观利润接近",
-            npd["value"], "元", evidence(npd, f))
+                          f"{ratio:.2f}%，{judge}",
+            npd["value"], "元", evidence(npd, f), conf="高" if ratio >= 90 else "中")
     if npp and m.get("nre") and npp["value"]:
         nre = m["nre"]
-        add("C3b", "质量", f"非经常性损益 {money(nre['value'])}，仅占归母净利润 "
-                           f"{nre['value'] / npp['value'] * 100:.2f}%，利润质量不依赖一次性收益",
-            nre["value"], "元", evidence(nre, f))
+        share = nre["value"] / npp["value"] * 100
+        if nre["value"] >= 0:
+            judge = (f"占归母净利润 {share:.2f}%，利润质量不依赖一次性收益" if abs(share) < 5
+                     else f"占归母净利润 {share:.2f}%，占比较高，需结合一次性收益的可持续性看")
+            head = "非经常性损益"
+        else:
+            judge = f"为净损失，相当于归母净利润的 {abs(share):.2f}%，表观利润低于主业盈利"
+            head = "非经常性损益"
+        add("C3b", "质量", f"{head} {money(nre['value'])}，{judge}",
+            nre["value"], "元", evidence(nre, f), conf="中" if nre["value"] >= 0 else "高")
     if ocf and npp and npp["value"]:
-        add("C4", "现金流", f"经营活动现金流净额 {money(ocf['value'])}，同比 {pct(ocf.get('yoy'))}，"
-                            f"为归母净利润的 {ocf['value'] / npp['value']:.2f} 倍",
+        mult = ocf["value"] / npp["value"]
+        # 负数不能直接说"为…的 -1.46 倍"
+        mult_txt = (f"净流出额相当于归母净利润的 {abs(mult):.2f} 倍" if mult < 0
+                    else f"为归母净利润的 {mult:.2f} 倍")
+        add("C4", "现金流", f"经营活动现金流净额 {money(ocf['value'])}，同比 {pct(ocf.get('yoy'))}，{mult_txt}",
             ocf["value"], "元", evidence(ocf, f),
             caveat="现金流为负不等于经营恶化，需结合备货与账期看（见风险雷达 R1/R2）")
     for key, cid, name in (("inventory", "C5", "存货"), ("ar", "C5b", "应收账款")):
@@ -328,8 +391,9 @@ def attribution(f: dict) -> dict:
 
     gap = (npp.get("yoy") or growth(npp["value"], npp["prev"])) - (rev.get("yoy") or growth(rev["value"], rev["prev"]))
     inc = npp["value"] - npp["prev"]
-    exp_keys = [k for k in ("rd_exp", "sell_exp", "admin_exp") if m.get(k)]
-    covered, contributors = 0.0, []
+    exp_keys = [k for k in ("rd_exp", "sell_exp", "admin_exp")
+                if m.get(k) and m[k].get("prev") is not None and m[k]["prev"]]
+    covered, contributors, uncovered = 0.0, [], []
 
     if len(exp_keys) == 3 and inc:
         exp_now = sum(m[k]["value"] for k in exp_keys)
@@ -344,16 +408,48 @@ def attribution(f: dict) -> dict:
             "detail": f"费用率 {r_prev:.2f}% → {r_now:.2f}%（{delta:+.2f}pct），"
                       f"对应利润影响 {money(gain)} ÷ 利润增量 {money(inc)}",
         })
-    if m.get("nre") and inc:
-        share = m["nre"]["value"] / inc * 100
+    else:
+        uncovered.append("三费+研发费用率变动")
+        contributors.append({
+            "factor": "三费+研发费用率变动", "contribution_pct": None, "basis": "uncovered",
+            "detail": "销售/管理/研发费用中至少一项缺少上年同期，算不出费用率变动比例",
+        })
+
+    # 非经常性损益必须用「变动额 ÷ 利润增量」。用存量（本期金额）相除在数学上不成立：
+    # 实测同一份数据能算出 500% 以上的"贡献"，纯属口径错误。
+    nre = m.get("nre")
+    delta_nre = None
+    if nre:
+        if nre.get("prev") is not None:
+            delta_nre = nre["value"] - nre["prev"]
+        elif m.get("np_parent") and m.get("np_deduct") \
+                and m["np_parent"].get("prev") and m["np_deduct"].get("prev"):
+            # 归母 − 扣非 = 非经常性损益，两期都能算出变动额，不需要额外数据
+            delta_nre = ((m["np_parent"]["value"] - m["np_deduct"]["value"])
+                         - (m["np_parent"]["prev"] - m["np_deduct"]["prev"]))
+    if delta_nre is not None and inc:
+        share = delta_nre / inc * 100
         covered += share
-        contributors.append({"factor": "非经常性损益", "contribution_pct": share, "basis": "computed",
-                             "detail": f"非经常性损益 {money(m['nre']['value'])} ÷ 利润增量 {money(inc)}"})
+        contributors.append({
+            "factor": "非经常性损益变动", "contribution_pct": share, "basis": "computed",
+            "detail": f"非经常性损益变动 {money(delta_nre)} ÷ 利润增量 {money(inc)}",
+        })
+    else:
+        uncovered.append("非经常性损益变动")
+        contributors.append({
+            "factor": "非经常性损益变动", "contribution_pct": None, "basis": "uncovered",
+            "detail": "缺少上年同期非经常性损益（或归母/扣非的上年同期），不出比例",
+        })
     contributors.append({"factor": "毛利率变动", "contribution_pct": None, "basis": "uncovered",
                          "detail": "需从「营业成本」科目自行核算，当前未建卡 → 不出结论"})
+    uncovered.append("毛利率变动")
+    raw = covered
+    covered = max(0.0, min(100.0, raw))          # 比例必须在 [0,100]，否则界面会出现"未解释 -451%"
     out.update({"ok": True, "gap": gap, "profit_growth": npp.get("yoy"),
                 "revenue_growth": rev.get("yoy"), "profit_increment": inc,
-                "contributors": contributors, "covered_ratio": covered, "uncovered": ["毛利率变动"]})
+                "contributors": contributors, "covered_ratio": covered,
+                "raw_covered_ratio": round(raw, 2), "clamped": abs(raw - covered) > 0.05,
+                "uncovered": uncovered})
     return out
 
 
@@ -387,7 +483,8 @@ def risk_radar(f: dict) -> list[dict]:
         d = g - rev["yoy"]
         push("R2", "应收增速显著高于营收增速", "(应收期末/期初−1) − 营收同比", f"> {TH['R2']:.0f}pct",
              f"应收 {g:+.2f}%，营收 {rev['yoy']:+.2f}%，差值 {d:+.2f}pct",
-             "HIT" if d > TH["R2"] else "NOT_HIT", d > TH["R2"], ev_key="ar")
+             "HIT" if d > TH["R2"] else "NOT_HIT", d > TH["R2"],
+             note="季报基期与营收同比不完全对齐，仅作提示", ev_key="ar")
     else:
         push("R2", "应收增速显著高于营收增速", "(应收期末/期初−1) − 营收同比", f"> {TH['R2']:.0f}pct",
              "应收或营收数据未取得", "INSUFFICIENT", False)
@@ -500,28 +597,48 @@ def llm_chat(cfg: dict, system: str, user: str, max_tokens: int = 400) -> tuple[
         return None, f"调用失败：{type(exc).__name__}，已回退模板结论"
 
 
-def _allowed_numbers(f: dict) -> set[str]:
+def _numbers_in(text: str) -> list[str]:
+    """先归一化千分位再取数字：1,253.61 与 1253.61 必须被当成同一个数。"""
+    t = re.sub(r"(?<=\d),(?=\d{3})", "", text or "")
+    return re.findall(r"\d+(?:\.\d+)?", t)
+
+
+def allowed_numbers(f: dict, *materials: str) -> set[str]:
+    """白名单 = 事实集里的原值/亿/万缩放 + 输入材料中已出现的数字（含四舍五入变体）。"""
     allowed: set[str] = set()
+
+    def put(x) -> None:
+        if not isinstance(x, (int, float)) or x != x:
+            return
+        for y in (x, abs(x), x / 1e8, abs(x) / 1e8, x / 1e4, abs(x) / 1e4):
+            for spec in ("{:.2f}", "{:.1f}", "{:.0f}"):
+                s = spec.format(y)
+                allowed.add(s)
+                allowed.add(s.rstrip("0").rstrip("."))
+
     for m in f["metrics"].values():
         for k in ("value", "prev", "yoy"):
-            v = m.get(k)
-            if not isinstance(v, (int, float)):
-                continue
-            for x in (v, abs(v)):
-                for y in (x, x / 1e8, x / 1e4):
-                    allowed.add(f"{y:.2f}".rstrip("0").rstrip("."))
-                allowed.add(f"{x:.0f}")
+            put(m.get(k))
+    for text in materials:
+        for tok in _numbers_in(text):
+            allowed.add(tok)
+            try:
+                allowed.add(f"{float(tok):.1f}")   # 允许模型做一位小数取整
+            except ValueError:
+                pass
     return {a for a in allowed if a}
 
 
-def guard_numbers(text: str, f: dict) -> list[str]:
-    """返回越界数字列表；空列表 = 通过。"""
-    allowed = _allowed_numbers(f)
+def guard_numbers(text: str, f: dict, *materials: str) -> list[str]:
+    """返回越界数字列表；空列表 = 通过。materials 是允许引用的输入材料，不含待检文本本身。"""
+    allowed = allowed_numbers(f, *materials)
     banned = []
-    for token in re.findall(r"\d+(?:\.\d+)?", text):
+    for token in _numbers_in(text):
         if token in ("2024", "2025", "2026", "2027"):   # 年份免检
             continue
-        if any(a == token or a.startswith(token + ".") or token.startswith(a + ".") for a in allowed):
+        if token in allowed:
+            continue
+        if token.endswith(".0") and token[:-2] in allowed:
             continue
         banned.append(token)
     return banned
@@ -540,7 +657,7 @@ def polish_with_llm(text: str, f: dict, cfg: dict) -> dict:
     out, err = llm_chat(cfg, SYSTEM_PROMPT, f"请改写下面这段结论，保持数字完全一致：\n\n{text}", 320)
     if err or not out:
         return {"text": text, "mode": "TEMPLATE", "warn": err}
-    banned = guard_numbers(out, f)
+    banned = guard_numbers(out, f, text)   # 允许引用的只有"待改写原文"里已有的数字
     if banned:
         return {"text": text, "mode": "REJECTED",
                 "warn": f"AI 表述出现无出处数字 {banned[:3]}，已丢弃并改用模板结论"}
@@ -602,12 +719,20 @@ def _structured_answer(q: str, f: dict) -> dict | None:
         ocf, npp = m.get("ocf"), m.get("np_parent")
         if ocf and npp and npp["value"]:
             r = ocf["value"] / npp["value"]
-            lead = (f"经营活动现金流净额 {money(ocf['value'])}，归母净利润 {money(npp['value'])}——"
-                    f"现金流为净流出，净流出额相当于净利润的 {abs(r):.2f} 倍。[1][2] " if r < 0 else
-                    f"经营活动现金流净额 {money(ocf['value'])}，归母净利润 {money(npp['value'])}，"
-                    f"前者是后者的 {r:.2f} 倍。[1][2] ")
+            if r < 0:
+                lead = (f"经营活动现金流净额 {money(ocf['value'])}，归母净利润 {money(npp['value'])}——"
+                        f"现金流为净流出，净流出额相当于净利润的 {abs(r):.2f} 倍。[1][2] ")
+                # 因果句只在公司自述了存货/应收变动原因时才补，否则不替公司解释
+                if f.get("explanations", {}).get("R1") or f.get("explanations", {}).get("R2"):
+                    tail = "净利润为正而经营现金流为负，差额的去向可对照下方引文里存货与应收的变动原因。"
+                else:
+                    tail = "净利润为正而经营现金流为负，说明本期利润尚未转化为现金；差额去向需结合存货与应收科目自行核对。"
+            else:
+                lead = (f"经营活动现金流净额 {money(ocf['value'])}，归母净利润 {money(npp['value'])}，"
+                        f"前者是后者的 {r:.2f} 倍。[1][2] ")
+                tail = "经营现金流不低于净利润，说明本期利润已基本转化为现金。"
             return {"ok": True, "mode": "STRUCTURED", "warn": None,
-                    "answer": lead + "净利润为正而经营现金流为负，说明利润尚未转化为现金，主要停留在应收与存货上。",
+                    "answer": lead + tail,
                     "citations": _cite(f, ["ocf", "np_parent"])}
     for key, kw, rid in (("inventory", "存货", "R1"), ("ar", "应收", "R2")):
         if kw in q:
@@ -685,7 +810,7 @@ def answer_question(q: str, f: dict, cfg: dict) -> dict:
         out, err = llm_chat(cfg, SYSTEM_PROMPT, prompt, 400)
         if err or not out:
             return {"ok": True, "answer": _extractive(q, top), "citations": top, "mode": "EXTRACTIVE", "warn": err}
-        banned = guard_numbers(out, f)
+        banned = guard_numbers(out, f, "\n".join(c["text"] for c in top))
         if banned:
             return {"ok": True, "answer": _extractive(q, top), "citations": top, "mode": "EXTRACTIVE",
                     "warn": f"AI 答案出现无出处数字 {banned[:3]}，已改用原文摘录"}
@@ -708,9 +833,12 @@ def payload(f: dict, claims: list, attr: dict, radar: list, as_of: date) -> dict
     return {
         "meta": {"code": f["code"], "name": f["name"], "period": f["period"],
                  "doc_title": f["doc_title"], "published_at": f["published_at"],
-                 "pdf_url": f["pdf_url"], "page": f.get("page"), "as_of": as_of.isoformat(),
+                 "pdf_url": f["pdf_url"], "page": f.get("page"),
+                 "offset_kind": f.get("offset_kind", "页内字符偏移"), "as_of": as_of.isoformat(),
                  "source": "uploaded" if f["uploaded_count"] else "builtin",
                  "uploaded_count": f["uploaded_count"], "mixed": f.get("mixed", False),
+                 "carried_over": f.get("carried_over", []),
+                 "subject_unverified": f.get("subject_unverified", False),
                  "disclosure_unknown": f.get("disclosure_unknown", False),
                  "coverage": {"present": present, "missing": [k for k in CORE if k not in f["metrics"]],
                               "ratio": round(len(present) / len(CORE) * 100, 1)}},
@@ -720,13 +848,16 @@ def payload(f: dict, claims: list, attr: dict, radar: list, as_of: date) -> dict
 
 
 def build_report(f: dict, claims: list, attr: dict, radar: list) -> str:
+    source = f"{f['doc_title']} {f['pdf_url']}" if f.get("pdf_url") else \
+        f"{f['doc_title']}（上传件，无外部链接，字符偏移基于上传文本全文）"
     lines = [f"# {f['name']}（{f['code']}）财报速读", f"- 报告期：{f['period']}",
-             f"- 披露日：{f['published_at']}", f"- 来源：{f['doc_title']} {f['pdf_url']}",
+             f"- 披露日：{f['published_at']}", f"- 来源：{source}",
              f"- 生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M')}", "", "## 结论"]
     for c in claims:
         ev = c["evidence"]
+        loc = f"第 {ev['page']} 页 · " if ev.get("page") else ""
         lines += [f"- [{c['confidence']}] {c['text']}",
-                  f"  - 出处：{ev['doc']} · 第 {ev.get('page')} 页 · 字符偏移 {ev.get('offset')}",
+                  f"  - 出处：{ev['doc']} · {loc}{ev.get('offset_kind', '页内字符偏移')} {ev.get('offset')}",
                   f"  - 原文：{ev['quote'][:90]}".replace("\n", " ")]
         if c.get("caveat"):
             lines.append(f"  - 口径提示：{c['caveat']}")
@@ -773,16 +904,30 @@ def parse_date(s: str | None) -> date:
         raise ApiError(400, "BAD_DATE", f"日期格式应为 YYYY-MM-DD，收到：{s}")
 
 
-def do_analyze(code: str, as_of_s: str | None, uploaded: dict | None) -> dict:
+def resolve_facts(code: str | None, as_of_s: str | None, uploaded: dict | None = None,
+                  uploaded_meta: dict | None = None) -> tuple[dict, date]:
+    """所有接口共用的取数与可用性校验入口：四个接口的拦截规则必须一致。"""
+    if not code:
+        raise ApiError(400, "MISSING_CODE", f"缺少 code 参数。可用：{', '.join(COMPANIES)}")
     if code not in COMPANIES:
         raise ApiError(404, "UNKNOWN_CODE", f"未收录该代码：{code}。可用：{', '.join(COMPANIES)}")
     as_of = parse_date(as_of_s)
-    f = build_facts(code, uploaded, as_of)
+    if as_of > date.today():
+        raise ApiError(400, "FUTURE_DATE",
+                       f"稿件日期 {as_of.isoformat()} 晚于今天 {date.today().isoformat()}，"
+                       f"不能用尚未发生的日期分析。")
+    f = build_facts(code, uploaded, as_of, uploaded_meta)
     # 硬约束：稿件日期早于披露日 → 使用了当时还不存在的信息，直接拦截，不生成结论
     if not uploaded and as_of.isoformat() < f["published_at"]:
         raise ApiError(409, "FUTURE_INFO",
                        f"稿件日期 {as_of.isoformat()} 早于该报告披露日 {f['published_at']}，"
                        f"此时引用报告数据属于使用未来信息，已拦截。")
+    return f, as_of
+
+
+def do_analyze(code: str | None, as_of_s: str | None, uploaded: dict | None = None,
+               uploaded_meta: dict | None = None) -> dict:
+    f, as_of = resolve_facts(code, as_of_s, uploaded, uploaded_meta)
     return payload(f, make_claims(f), attribution(f), risk_radar(f), as_of)
 
 
@@ -835,22 +980,18 @@ class Handler(BaseHTTPRequestHandler):
                  "published_at": c["published_at"], "metrics": len(c["metrics"]),
                  "coverage": [k for k in CORE if k in c["metrics"]]} for c in COMPANIES.values()]})
         if path == "/api/analyze":
-            return self.guard(lambda: self.send(200, do_analyze(qs.get("code", "002281"), qs.get("as_of"), None)))
+            return self.guard(lambda: self.send(200, do_analyze(qs.get("code"), qs.get("as_of"))))
         if path == "/api/report":
             def report():
-                code = qs.get("code", "002281")
-                if code not in COMPANIES:
-                    raise ApiError(404, "UNKNOWN_CODE", f"未收录该代码：{code}")
-                f = build_facts(code, None, parse_date(qs.get("as_of")))
+                f, _ = resolve_facts(qs.get("code"), qs.get("as_of"))
                 md = build_report(f, make_claims(f), attribution(f), risk_radar(f))
-                name = f"FinLens_{code}_{f['published_at']}.md"
-                return self.send(200, md.encode(), f"text/markdown; charset=utf-8")
+                return self.send(200, md.encode(), "text/markdown; charset=utf-8")
             return self.guard(report)
 
         # 静态文件（含目录穿越防护）
         rel = "/index.html" if path == "/" else path
         target = (STATIC / rel.lstrip("/")).resolve()
-        if not str(target).startswith(str(STATIC.resolve())):
+        if not target.is_relative_to(STATIC.resolve()):
             return self.send(403, "forbidden", "text/plain; charset=utf-8")
         if target.is_file():
             return self.send(200, target.read_bytes(), MIME.get(target.suffix, "application/octet-stream"))
@@ -860,10 +1001,16 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         qs = {k: v[0] for k, v in parse_qs(u.query).items()}
         length = int(self.headers.get("Content-Length") or 0)
+        # 先按声明长度拦截超大文件，避免把内存打满再报错
+        if u.path == "/api/upload" and length > 80 * 1024 * 1024:
+            return self.send(413, {"error": {"code": "TOO_LARGE",
+                                             "message": "文件超过 80MB，请仅上传所需报告期的那一份。"}})
         raw = self.rfile.read(length) if length else b""
 
         if u.path == "/api/analyze":
-            return self.guard(lambda: self.send(200, do_analyze(qs.get("code", "002281"), qs.get("as_of"), None)))
+            return self.send(405, {"error": {"code": "METHOD_NOT_ALLOWED",
+                                             "message": "分析请使用 GET /api/analyze?code=&as_of="}},
+                             "application/json; charset=utf-8")
 
         if u.path == "/api/upload":
             def upload():
@@ -872,9 +1019,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not metrics:
                     raise ApiError(422, "NO_METRIC",
                                    "未能从该文件中抽取到可核对指标。可能原因：扫描件、非财报、或版式差异过大。")
-                res = do_analyze(qs.get("code", "002281"), qs.get("as_of"), metrics)
+                meta = extract_meta(parsed["text"])
+                res = do_analyze(qs.get("code"), qs.get("as_of"), metrics, meta)
                 res["upload"] = {"pages": parsed["pages"], "chars": len(parsed["text"]),
-                                 "extracted": len(metrics),
+                                 "extracted": len(metrics), "subject": meta.get("subject"),
                                  "note": "披露日无法从 PDF 元数据可靠取得，已按稿件日期处理并标注未知；"
                                          "未能抽取的科目沿用内置快照，已在 mixed 标记。"}
                 return self.send(200, res)
@@ -883,13 +1031,11 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/qa":
             def qa():
                 body = self.body_json(raw)
-                code = body.get("code", "002281")
-                if code not in COMPANIES:
-                    raise ApiError(404, "UNKNOWN_CODE", f"未收录该代码：{code}")
                 q = (body.get("q") or "").strip()
                 if not q:
                     raise ApiError(400, "EMPTY_QUERY", "请输入问题")
-                f = build_facts(code, None, parse_date(body.get("as_of")))
+                f, _ = resolve_facts(body.get("code"), body.get("as_of"),
+                                     body.get("upload_metrics") or None)
                 res = answer_question(q, f, cfg_from(body))
                 res["disclaimer"] = DISCLAIMER
                 return self.send(200, res)
@@ -898,13 +1044,11 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/polish":
             def polish():
                 body = self.body_json(raw)
-                code = body.get("code", "002281")
-                if code not in COMPANIES:
-                    raise ApiError(404, "UNKNOWN_CODE", f"未收录该代码：{code}")
-                f = build_facts(code, None, parse_date(body.get("as_of")))
                 text = (body.get("text") or "").strip()
                 if not text:
                     raise ApiError(400, "EMPTY_TEXT", "缺少待改写文本")
+                f, _ = resolve_facts(body.get("code"), body.get("as_of"),
+                                     body.get("upload_metrics") or None)
                 return self.send(200, polish_with_llm(text, f, cfg_from(body)))
             return self.guard(polish)
 
